@@ -1,3 +1,3 @@
-from .packer import CirclePacker
+from .packer import CirclePacker, PackingConfig
 
-__all__ = ["CirclePacker"]
+__all__ = ["CirclePacker", "PackingConfig"]
