@@ -1,83 +1,76 @@
 import unittest
 import numpy as np
-from circlepacker.packer import CirclePacker
+from circlepacker.packer import CirclePacker, PackingConfig, PolygonGeometry
 
-class TestPackerLogic(unittest.TestCase):
+
+
+
+class TestCirclePacker(unittest.TestCase):
     def setUp(self):
-        """Initialize a standard 100x100 square for testing."""
-        self.vertices = [(0, 0), (100, 0), (100, 100), (0, 100)]
-        self.packer = CirclePacker(self.vertices, padding=0.1)
+        """Set up a simple 10x10 square for testing."""
+        self.square_verts = np.array([[0, 0], [10, 0], [10, 10], [0, 10]])
+        self.square = [self.square_verts]
+        # Use small padding/min_radius to allow for dense filling
+        self.config = PackingConfig(padding=0.1, min_radius=0.5, patience_before_stop=100)
 
-    # --- Test Geometric Utilities ---
+    def _calculate_poly_area(self, segments: list) -> float:
+        """Calculates area of polygons (including holes) using the Shoelace Formula."""
+        total_area = 0
+        for poly in segments:
+            x = poly[:, 0]
+            y = poly[:, 1]
+            # Area = 0.5 * |sum(x_i * y_{i+1} - x_{i+1} * y_i)|
+            area = 0.5 * np.abs(np.dot(x, np.roll(y, 1)) - np.dot(y, np.roll(x, 1)))
+            # If it's a hole (clockwise), it naturally subtracts if we don't use abs here,
+            # but since our parser handles holes via Even-Odd, we treat all as positive 
+            # and subtract holes manually if needed. For this test, we assume shells.
+            total_area += area
+        return total_area
 
-    def test_wall_distance(self):
-        """Verify the boundary distance calculation is accurate."""
-        # A point at (5, 50) should be exactly 5 units from the left wall
-        dist = self.packer._get_wall_dist(np.array([5.0, 50.0]))
-        self.assertAlmostEqual(dist, 5.0)
-
-    # --- Test Spatial Hashing & Mega-Circles ---
-
-    def test_mega_circle_routing(self):
-        """Ensure large circles are correctly routed to the global list."""
-        # cell_size is 4 in a 100x100 grid (100/25). r > 2 is 'Mega'.
-        self.packer.centers.append(np.array([50.0, 50.0]))
-        self.packer.radii.append(10.0) 
-        self.packer._add_to_lookup(0)
+    def test_filling_density(self):
+        """Verify that the packer fills a minimum percentage of the polygon area."""
+        packer = CirclePacker(self.square, self.config)
+        circles = list(packer.generate())
         
-        self.assertIn(0, self.packer.mega_circles)
-        self.assertEqual(len(self.packer.grid), 0)
-
-    def test_grid_neighbor_lookup(self):
-        """Ensure small circles are routed to and found in the local grid."""
-        # Add a small circle (r=0.5)
-        self.packer.centers.append(np.array([10.0, 10.0]))
-        self.packer.radii.append(0.5)
-        self.packer._add_to_lookup(0)
+        # Calculate areas
+        poly_area = self._calculate_poly_area(self.square)
+        circle_area = sum(np.pi * (r**2) for _, _, r in circles)
         
-        # Checking neighbors for a point at (11, 10)
-        # It should detect circle 0 in the neighborhood
-        min_dist = self.packer._check_grid_neighbors(np.array([11.0, 10.0]), 100.0)
-        # Dist center-to-center is 1.0, minus radius 0.5 = 0.5
-        self.assertAlmostEqual(min_dist, 0.5)
-
-    # --- Test Safety & Overlap Prevention ---
-
-    def test_no_overlap_guarantee(self):
-        """Verify the integrated get_max_safe_radius prevents overlaps."""
-        # Add a large circle
-        self.packer.centers.append(np.array([50.0, 50.0]))
-        self.packer.radii.append(20.0)
-        self.packer._add_to_lookup(0)
+        fill_percentage = (circle_area / poly_area) * 100
         
-        # Test a point at (50, 75). Distance to circle edge is 5.0.
-        safe_r = self.packer.get_max_safe_radius(np.array([50.0, 75.0]))
+        print(f"\nFill Analysis: {len(circles)} circles placed.")
+        print(f"Total Area: {poly_area:.2f} | Circle Area: {circle_area:.2f}")
+        print(f"Packing Density: {fill_percentage:.2f}%")
         
-        # Radius must be <= 5.0 - padding
-        self.assertLessEqual(safe_r, 5.0 - self.packer.padding)
+        # Assert a minimum density threshold. 
+        # For a random packer, 30-50% is a reasonable 'success' floor depending on radius.
+        self.assertGreater(fill_percentage, 25.0, f"Packing density too low: {fill_percentage:.2f}%")
 
-    # --- Test Sampling & Performance ---
+    def test_geometry_containment(self):
+        """Verify the Even-Odd rule correctly identifies the interior."""
+        geo = PolygonGeometry(self.square)
+        test_pts = np.array([
+            [5, 5],   # Center
+            [15, 5],  # Far outside
+            [-1, -1]  # Outside
+        ])
+        results = geo.contains_points(test_pts)
+        self.assertTrue(results[0])
+        self.assertFalse(results[1])
+        self.assertFalse(results[2])
 
-    def test_vectorized_sampling(self):
-        """Ensure the batch sampler handles polygon boundaries correctly."""
-        best_pt, best_r = self.packer._find_best_candidate(num_samples=50)
+    def test_no_overlap_integrity(self):
+        """Mathematically verify no circles overlap including padding."""
+        packer = CirclePacker(self.square, self.config)
+        circles = list(packer.generate())
         
-        if best_pt is not None:
-            # The best point MUST be inside the square
-            self.assertTrue(0 <= best_pt[0] <= 100)
-            self.assertTrue(0 <= best_pt[1] <= 100)
-            self.assertGreater(best_r, 0)
-
-    def test_generator_convergence(self):
-        """Verify the generator stops when patience is exhausted."""
-        # Use a tiny area and high min_radius to force early saturation
-        small_packer = CirclePacker([(0,0), (10,0), (10,10), (0,10)])
-        count = 0
-        for _ in small_packer.generate(attempts=100, min_radius=8.0, patience=2):
-            count += 1
-        
-        # Should stop very quickly as a radius of 8 won't fit twice
-        self.assertLess(count, 5)
+        for i, (x1, y1, r1) in enumerate(circles):
+            for j, (x2, y2, r2) in enumerate(circles):
+                if i == j: continue
+                dist = np.sqrt((x1 - x2)**2 + (y1 - y2)**2)
+                # Distance must be >= sum of radii + padding
+                min_sep = r1 + r2 + self.config.padding
+                self.assertGreaterEqual(dist, min_sep - 1e-9)
 
 if __name__ == '__main__':
     unittest.main()
