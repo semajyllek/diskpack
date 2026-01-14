@@ -15,10 +15,26 @@ class PackingConfig:
     padding: float = 1.5
     min_radius: float = 1.0
     grid_resolution_divisor: float = 25
-    patience_before_stop: int = 200
+    max_failed_attempts: int = 200
     mega_circle_threshold: float = 0.5
     ray_cast_epsilon: float = 1e-10
     sample_batch_size: int = 50
+
+
+@dataclass
+class PackingProgress:
+    """Tracks the current state of the packing algorithm."""
+    circles_placed: int = 0
+    failed_attempts: int = 0
+    max_failed_attempts: int = 200
+    
+    @property
+    def progress_ratio(self) -> float:
+        """How close we are to stopping (0.0 = just started, 1.0 = about to stop)."""
+        return self.failed_attempts / self.max_failed_attempts
+    
+    def __str__(self) -> str:
+        return f"Placed: {self.circles_placed} | Failed attempts: {self.failed_attempts}/{self.max_failed_attempts} ({self.progress_ratio:.0%})"
 
 
 class PolygonGeometry:
@@ -107,6 +123,7 @@ class CirclePacker:
         self.geometry = PolygonGeometry(polygons, self.config.ray_cast_epsilon)
         self.centers: List[Point] = []
         self.radii: List[float] = []
+        self.progress = PackingProgress(max_failed_attempts=self.config.max_failed_attempts)
 
         extent = max(self.geometry.max_coords - self.geometry.min_coords)
         cell_size = extent / self.config.grid_resolution_divisor
@@ -150,18 +167,42 @@ class CirclePacker:
         self.radii.append(radius)
         self.spatial_index.add_circle(idx, center, radius)
 
-    def generate(self, fixed_radius: Optional[float] = None) -> Iterator[Circle]:
-        consecutive_misses = 0
-        while consecutive_misses < self.config.patience_before_stop:
+    def generate(self, fixed_radius: Optional[float] = None, verbose: bool = False) -> Iterator[Circle]:
+        """
+        Generate circles until no more can be placed.
+        
+        Args:
+            fixed_radius: If provided, all circles will have this exact radius.
+            verbose: If True, print progress updates periodically.
+        
+        Yields:
+            Tuples of (x, y, radius) for each placed circle.
+        """
+        self.progress = PackingProgress(max_failed_attempts=self.config.max_failed_attempts)
+        
+        while self.progress.failed_attempts < self.config.max_failed_attempts:
             candidates = self._sample_candidate_points(self.config.sample_batch_size)
             result = self._find_best_placement(candidates, fixed_radius)
+            
             if result is not None:
                 center, radius = result
                 self._place_circle(center, radius)
-                consecutive_misses = 0
+                self.progress.circles_placed += 1
+                self.progress.failed_attempts = 0
+                
+                if verbose and self.progress.circles_placed % 25 == 0:
+                    print(self.progress)
+                
                 yield (float(center[0]), float(center[1]), float(radius))
             else:
-                consecutive_misses += 1
+                self.progress.failed_attempts += 1
+                
+                if verbose and self.progress.failed_attempts % 50 == 0:
+                    print(self.progress)
 
-    def pack(self, fixed_radius: Optional[float] = None) -> List[Circle]:
-        return list(self.generate(fixed_radius))
+        if verbose:
+            print(f"Done! {self.progress}")
+
+    def pack(self, fixed_radius: Optional[float] = None, verbose: bool = False) -> List[Circle]:
+        """Pack circles and return them as a list."""
+        return list(self.generate(fixed_radius, verbose=verbose))
