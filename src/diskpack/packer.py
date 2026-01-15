@@ -46,11 +46,27 @@ class PolygonGeometry:
         self.polygons = [np.array(p, dtype=float) for p in polygons]
         self.epsilon = epsilon
         self._compute_bounds()
+        self._precompute_edges()
 
     def _compute_bounds(self) -> None:
         all_vertices = np.vstack(self.polygons)
         self.min_coords = np.min(all_vertices, axis=0)
         self.max_coords = np.max(all_vertices, axis=0)
+
+    def _precompute_edges(self) -> None:
+        """Precompute edge data for vectorized distance calculations."""
+        all_p1 = []
+        all_p2 = []
+        for poly in self.polygons:
+            n = len(poly)
+            for i in range(n):
+                all_p1.append(poly[i])
+                all_p2.append(poly[(i + 1) % n])
+
+        self.edge_starts = np.array(all_p1)
+        self.edge_ends = np.array(all_p2)
+        self.edge_vecs = self.edge_ends - self.edge_starts
+        self.edge_lengths_sq = np.sum(self.edge_vecs ** 2, axis=1)
 
     def contains_points(self, points: np.ndarray) -> np.ndarray:
         """Even-Odd Rule for interior detection, supports holes."""
@@ -69,22 +85,55 @@ class PolygonGeometry:
         return inside
 
     def distance_to_boundary(self, point: Point) -> float:
-        min_distance = float('inf')
-        for poly in self.polygons:
-            for i in range(len(poly)):
-                p1, p2 = poly[i], poly[(i + 1) % len(poly)]
-                min_distance = min(min_distance, self._point_to_segment_distance(point, p1, p2))
-        return min_distance
+        """Vectorized distance to nearest polygon edge."""
+        to_point = point - self.edge_starts
 
-    @staticmethod
-    def _point_to_segment_distance(point: Point, seg_start: Point, seg_end: Point) -> float:
-        segment_vec = seg_end - seg_start
-        segment_length_sq = np.sum(segment_vec ** 2)
-        if segment_length_sq == 0:
-            return np.linalg.norm(point - seg_start)
-        t = np.clip(np.dot(point - seg_start, segment_vec) / segment_length_sq, 0, 1)
-        projection = seg_start + t * segment_vec
-        return np.linalg.norm(point - projection)
+        dots = np.sum(to_point * self.edge_vecs, axis=1)
+
+        with np.errstate(divide='ignore', invalid='ignore'):
+            t = np.clip(dots / self.edge_lengths_sq, 0, 1)
+            t = np.where(self.edge_lengths_sq == 0, 0, t)
+
+        projections = self.edge_starts + t[:, np.newaxis] * self.edge_vecs
+        distances = np.linalg.norm(point - projections, axis=1)
+
+        return float(np.min(distances))
+
+    def distances_to_boundary_batch(self, points: np.ndarray) -> np.ndarray:
+        """
+        Vectorized distance calculation for multiple points at once.
+        
+        Args:
+            points: Array of shape (n_points, 2)
+            
+        Returns:
+            Array of shape (n_points,) with distance to nearest edge for each point
+        """
+        n_points = len(points)
+        n_edges = len(self.edge_starts)
+
+        # Reshape for broadcasting: (n_points, 1, 2) - (n_edges, 2) -> (n_points, n_edges, 2)
+        to_point = points[:, np.newaxis, :] - self.edge_starts[np.newaxis, :, :]
+
+        # Dot products: (n_points, n_edges)
+        dots = np.sum(to_point * self.edge_vecs[np.newaxis, :, :], axis=2)
+
+        # Project onto edges
+        with np.errstate(divide='ignore', invalid='ignore'):
+            t = np.clip(dots / self.edge_lengths_sq[np.newaxis, :], 0, 1)
+            t = np.where(self.edge_lengths_sq[np.newaxis, :] == 0, 0, t)
+
+        # Closest points on edges: (n_points, n_edges, 2)
+        projections = (
+            self.edge_starts[np.newaxis, :, :] + 
+            t[:, :, np.newaxis] * self.edge_vecs[np.newaxis, :, :]
+        )
+
+        # Distances: (n_points, n_edges)
+        distances = np.linalg.norm(points[:, np.newaxis, :] - projections, axis=2)
+
+        # Min distance per point
+        return np.min(distances, axis=1)
 
 
 @dataclass
@@ -95,8 +144,16 @@ class SpatialIndex:
     mega_threshold: float
     grid: Dict[GridKey, List[int]] = field(default_factory=dict)
     mega_circles: List[int] = field(default_factory=list)
+    
+    # Store centers/radii arrays for vectorized lookup
+    _centers: np.ndarray = field(default_factory=lambda: np.empty((0, 2)))
+    _radii: np.ndarray = field(default_factory=lambda: np.empty(0))
 
     def add_circle(self, index: int, center: Point, radius: float) -> None:
+        # Update arrays
+        self._centers = np.vstack([self._centers, center]) if len(self._centers) > 0 else center.reshape(1, 2)
+        self._radii = np.append(self._radii, radius)
+        
         if radius > self.cell_size * self.mega_threshold:
             self.mega_circles.append(index)
         else:
@@ -111,6 +168,43 @@ class SpatialIndex:
                 neighbor_key = (center_key[0] + dx, center_key[1] + dy)
                 if neighbor_key in self.grid:
                     yield from self.grid[neighbor_key]
+
+    def get_nearby_indices_batch(self, points: np.ndarray) -> List[np.ndarray]:
+        """
+        Get nearby circle indices for multiple points.
+        Returns list of index arrays, one per point.
+        """
+        results = []
+        mega_set = set(self.mega_circles)
+        
+        for point in points:
+            indices = list(self.mega_circles)
+            center_key = self._get_cell_key(point)
+            for dx in range(-1, 2):
+                for dy in range(-1, 2):
+                    neighbor_key = (center_key[0] + dx, center_key[1] + dy)
+                    if neighbor_key in self.grid:
+                        for idx in self.grid[neighbor_key]:
+                            if idx not in mega_set:
+                                indices.append(idx)
+            results.append(np.array(indices, dtype=int))
+        
+        return results
+
+    def distance_to_circles(self, point: Point) -> float:
+        """Get minimum distance from point to any existing circle's edge."""
+        if len(self._centers) == 0:
+            return float('inf')
+        
+        indices = list(self.get_nearby_indices(point))
+        if not indices:
+            return float('inf')
+        
+        centers = self._centers[indices]
+        radii = self._radii[indices]
+        
+        distances = np.linalg.norm(centers - point, axis=1) - radii
+        return float(np.min(distances))
 
     def _get_cell_key(self, point: Point) -> GridKey:
         cell_coords = ((point - self.origin) // self.cell_size).astype(int)
@@ -144,26 +238,62 @@ class CirclePacker:
         return points[self.geometry.contains_points(points)]
 
     def _compute_max_radius(self, point: Point) -> float:
+        """Compute max radius for a single point."""
         max_radius = self.geometry.distance_to_boundary(point)
-        for idx in self.spatial_index.get_nearby_indices(point):
-            distance_to_circle = np.linalg.norm(self.centers[idx] - point) - self.radii[idx]
-            max_radius = min(max_radius, distance_to_circle)
+        circle_dist = self.spatial_index.distance_to_circles(point)
+        max_radius = min(max_radius, circle_dist)
         return max_radius - self.config.padding
 
-    def _find_best_placement(self, candidates: np.ndarray) -> Optional[Tuple[Point, float]]:
-        best_point, best_radius = None, 0
-        fixed = self.config.fixed_radius
-        
-        for point in candidates:
-            radius = self._compute_max_radius(point)
-            if fixed is not None:
-                radius = fixed if radius >= fixed else -1
-            if radius > best_radius:
-                best_point, best_radius = point, radius
+    def _compute_max_radii_batch(self, points: np.ndarray) -> np.ndarray:
+        """
+        Vectorized max radius computation for multiple points.
+        """
+        if len(points) == 0:
+            return np.array([])
 
-        if best_point is not None and best_radius >= self.config.min_radius:
-            return best_point, best_radius
-        return None
+        # Boundary distances (fully vectorized)
+        max_radii = self.geometry.distances_to_boundary_batch(points)
+
+        # Circle collision distances (per-point, but with vectorized distance calc)
+        if len(self.centers) > 0:
+            centers_arr = np.array(self.centers)
+            radii_arr = np.array(self.radii)
+            
+            for i, point in enumerate(points):
+                # Get nearby indices
+                indices = list(self.spatial_index.get_nearby_indices(point))
+                if indices:
+                    nearby_centers = centers_arr[indices]
+                    nearby_radii = radii_arr[indices]
+                    distances = np.linalg.norm(nearby_centers - point, axis=1) - nearby_radii
+                    max_radii[i] = min(max_radii[i], np.min(distances))
+
+        return max_radii - self.config.padding
+
+    def _find_best_placement(self, candidates: np.ndarray) -> Optional[Tuple[Point, float]]:
+        if len(candidates) == 0:
+            return None
+
+        # Batch compute all radii
+        radii = self._compute_max_radii_batch(candidates)
+        fixed = self.config.fixed_radius
+
+        if fixed is not None:
+            # For fixed radius, filter to valid positions and pick randomly
+            valid_mask = radii >= fixed
+            if not np.any(valid_mask):
+                return None
+            valid_indices = np.where(valid_mask)[0]
+            best_idx = valid_indices[0]  # Take first valid (or could randomize)
+            return candidates[best_idx], fixed
+        else:
+            # Variable radius: pick the largest
+            best_idx = np.argmax(radii)
+            best_radius = radii[best_idx]
+            
+            if best_radius >= self.config.min_radius:
+                return candidates[best_idx], best_radius
+            return None
 
     def _place_circle(self, center: Point, radius: float) -> None:
         idx = len(self.centers)
