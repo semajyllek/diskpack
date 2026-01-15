@@ -8,6 +8,9 @@ Point = np.ndarray
 GridKey = Tuple[int, int]
 Circle = Tuple[float, float, float]
 
+# Threshold for switching between vectorized and spatial index approaches
+VECTORIZED_THRESHOLD = 300
+
 
 @dataclass
 class PackingConfig:
@@ -192,6 +195,27 @@ class CirclePacker:
             origin=self.geometry.min_coords,
             mega_threshold=self.config.mega_circle_threshold
         )
+        
+        # Cache for numpy arrays (avoid repeated conversion)
+        self._centers_arr: Optional[np.ndarray] = None
+        self._radii_arr: Optional[np.ndarray] = None
+        self._cache_valid = False
+
+    def _invalidate_cache(self) -> None:
+        """Mark the numpy array cache as needing refresh."""
+        self._cache_valid = False
+
+    def _get_arrays(self) -> Tuple[np.ndarray, np.ndarray]:
+        """Get cached numpy arrays of centers and radii."""
+        if not self._cache_valid or self._centers_arr is None:
+            if len(self.centers) > 0:
+                self._centers_arr = np.array(self.centers)
+                self._radii_arr = np.array(self.radii)
+            else:
+                self._centers_arr = np.empty((0, 2))
+                self._radii_arr = np.empty(0)
+            self._cache_valid = True
+        return self._centers_arr, self._radii_arr
 
     def _sample_candidate_points(self, count: int) -> np.ndarray:
         points = np.random.uniform(
@@ -209,16 +233,37 @@ class CirclePacker:
         return max_radius - self.config.padding
 
     def _compute_max_radii_batch(self, points: np.ndarray) -> np.ndarray:
-        """Vectorized max radius computation for multiple points."""
+        """
+        Vectorized max radius computation for multiple points.
+        
+        Uses hybrid approach:
+        - Fully vectorized numpy for small circle counts (faster due to no Python loop)
+        - Spatial index for large circle counts (faster due to fewer distance calculations)
+        """
         if len(points) == 0:
             return np.array([])
 
+        # Boundary distances (fully vectorized)
         max_radii = self.geometry.distances_to_boundary_batch(points)
 
-        if len(self.centers) > 0:
-            centers_arr = np.array(self.centers)
-            radii_arr = np.array(self.radii)
+        if len(self.centers) == 0:
+            return max_radii - self.config.padding
 
+        centers_arr, radii_arr = self._get_arrays()
+
+        if len(self.centers) < VECTORIZED_THRESHOLD:
+            # Fully vectorized approach for small circle counts
+            # Compute distance from each point to each circle: (n_points, n_circles)
+            dists = np.linalg.norm(
+                points[:, np.newaxis, :] - centers_arr[np.newaxis, :, :],
+                axis=2
+            ) - radii_arr
+            
+            # Min distance to any circle for each point
+            min_circle_dists = np.min(dists, axis=1)
+            max_radii = np.minimum(max_radii, min_circle_dists)
+        else:
+            # Spatial index approach for large circle counts
             for i, point in enumerate(points):
                 indices = list(self.spatial_index.get_nearby_indices(point))
                 if indices:
@@ -256,6 +301,7 @@ class CirclePacker:
         self.centers.append(center)
         self.radii.append(radius)
         self.spatial_index.add_circle(idx, center, radius)
+        self._invalidate_cache()
 
     def _generate_hex_grid(self, radius: float) -> np.ndarray:
         """
