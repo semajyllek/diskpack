@@ -409,15 +409,37 @@ class CirclePacker:
                 heapq.heappush(candidates, (-radius, candidate_id, center, radius))
                 candidate_id += 1
 
-        # Seed candidates along edges
-        for edge_idx in range(len(self.geometry.edge_starts)):
-            if fixed_r is not None:
+        # =================================================================
+        # SEED PHASE: Generate initial candidates
+        # =================================================================
+        
+        if fixed_r is not None:
+            # Fixed radius: seed along edges
+            for edge_idx in range(len(self.geometry.edge_starts)):
                 edge_positions = self._find_tangent_circle_edge(edge_idx, fixed_r)
                 for center, t in edge_positions:
                     if self._is_valid_placement(center, fixed_r):
                         add_candidate(center, fixed_r)
-            else:
-                for test_r in [effective_min, effective_min * 2, effective_min * 4, self._max_possible_radius * 0.5]:
+        else:
+            # Variable radius: seed from both edges AND interior
+            
+            # 1. Sample interior points and add as candidates
+            interior_points = self._sample_candidate_points(200)
+            if len(interior_points) > 0:
+                interior_radii = self._compute_max_radii_batch(interior_points)
+                for pt, r in zip(interior_points, interior_radii):
+                    if r >= effective_min:
+                        add_candidate(pt, r)
+            
+            # 2. Sample along edges at various radii
+            test_radii = np.linspace(
+                effective_min, 
+                self._max_possible_radius * 0.9, 
+                15
+            )
+            
+            for edge_idx in range(len(self.geometry.edge_starts)):
+                for test_r in test_radii:
                     if test_r < effective_min:
                         continue
                     edge_positions = self._find_tangent_circle_edge(edge_idx, test_r)
@@ -427,6 +449,13 @@ class CirclePacker:
                             if max_r >= effective_min:
                                 add_candidate(center, max_r)
 
+        if self.config.verbose:
+            print(f"  Seeded {len(candidates)} initial candidates")
+
+        # =================================================================
+        # MAIN LOOP: Place circles and propagate front
+        # =================================================================
+        
         iterations = 0
         max_iterations = 100000
         
@@ -435,6 +464,7 @@ class CirclePacker:
             
             neg_radius, _, center, radius = heapq.heappop(candidates)
             
+            # Revalidate (conditions may have changed)
             if fixed_r is not None:
                 actual_radius = fixed_r
                 if not self._is_valid_placement(center, actual_radius):
@@ -446,12 +476,13 @@ class CirclePacker:
                 if not self._is_valid_placement(center, actual_radius):
                     continue
             
+            # Place the circle
             self._place_circle(center, actual_radius)
             circles.append((float(center[0]), float(center[1]), float(actual_radius)))
             
             new_circle_idx = len(self.centers) - 1
             
-            # Generate circle-circle candidates
+            # Generate circle-circle tangent candidates
             for other_idx in range(new_circle_idx):
                 pair = (min(other_idx, new_circle_idx), max(other_idx, new_circle_idx))
                 if pair in processed_pairs:
@@ -469,7 +500,10 @@ class CirclePacker:
                         if self._is_valid_placement(tc, fixed_r):
                             add_candidate(tc, fixed_r)
                 else:
-                    for test_r in [effective_min, effective_min * 2, effective_min * 4]:
+                    # Try multiple radii to find good tangent positions
+                    test_radii = [effective_min, effective_min * 1.5, effective_min * 2, 
+                                  effective_min * 3, effective_min * 5]
+                    for test_r in test_radii:
                         tangent_centers = self._find_tangent_circle_two_circles(
                             center, actual_radius, other_center, other_radius, test_r
                         )
@@ -479,7 +513,7 @@ class CirclePacker:
                                 if max_r >= effective_min:
                                     add_candidate(tc, max_r)
             
-            # Generate circle-edge candidates
+            # Generate circle-edge tangent candidates
             for edge_idx in range(len(self.geometry.edge_starts)):
                 ce_pair = (new_circle_idx, edge_idx)
                 if ce_pair in processed_circle_edge:
@@ -494,7 +528,8 @@ class CirclePacker:
                         if self._is_valid_placement(tc, fixed_r):
                             add_candidate(tc, fixed_r)
                 else:
-                    for test_r in [effective_min, effective_min * 2]:
+                    test_radii = [effective_min, effective_min * 1.5, effective_min * 2, effective_min * 3]
+                    for test_r in test_radii:
                         tangent_centers = self._find_tangent_circle_circle_and_edge(
                             new_circle_idx, edge_idx, test_r
                         )
@@ -542,10 +577,14 @@ class CirclePacker:
         """
         State-of-the-art hybrid packing algorithm.
         
-        Phase 1: Large circles using front-based packing
-        Phase 2: Medium circles using front-based packing
-        Phase 3: Small circles using micro hex grids in gaps
-        Phase 4: Cleanup using targeted random sampling
+        For variable radius:
+            Phase 1: Large circles (>= 50% of max) using front-based
+            Phase 2: Medium circles (>= 25% of max) using front-based
+            Phase 3: Small circles using random sampling (best for filling gaps)
+            
+        For fixed radius:
+            Phase 1: Front-based for optimal corner filling
+            Phase 2: Hex grid for any remaining regular spaces
         """
         all_circles = []
         
@@ -586,11 +625,11 @@ class CirclePacker:
                 print("=" * 60)
                 print(f"Estimated max radius: {self._max_possible_radius:.1f}")
             
-            # Phase 1: Large circles
+            # Phase 1: Large circles (>= 50% of max)
             self.progress.phase = "Large"
             large_threshold = self.config.hybrid_large_threshold
             if self.config.verbose:
-                print(f"\nPhase 1: Large circles (>= {large_threshold*100:.0f}% of max)")
+                print(f"\nPhase 1: Large circles (>= {large_threshold*100:.0f}% of max = {large_threshold * self._max_possible_radius:.1f})")
             
             circles = self._pack_front(min_radius_threshold=large_threshold)
             all_circles.extend(circles)
@@ -598,11 +637,11 @@ class CirclePacker:
             if self.config.verbose:
                 print(f"  Placed {len(circles)} large circles")
             
-            # Phase 2: Medium circles
+            # Phase 2: Medium circles (>= 25% of max)
             self.progress.phase = "Medium"
             medium_threshold = self.config.hybrid_medium_threshold
             if self.config.verbose:
-                print(f"\nPhase 2: Medium circles (>= {medium_threshold*100:.0f}% of max)")
+                print(f"\nPhase 2: Medium circles (>= {medium_threshold*100:.0f}% of max = {medium_threshold * self._max_possible_radius:.1f})")
             
             before = len(all_circles)
             circles = self._pack_front(min_radius_threshold=medium_threshold)
@@ -611,46 +650,49 @@ class CirclePacker:
             if self.config.verbose:
                 print(f"  Placed {len(all_circles) - before} medium circles")
             
-            # Phase 3: Micro hex grid fill
-            self.progress.phase = "Micro-fill"
-            min_gap = self.config.hybrid_micro_grid_min_gap
+            # Phase 3: Small circles using random sampling
+            # Random sampling is actually best for small circles because:
+            # - It naturally finds the largest available space
+            # - No geometric constraints from tangent calculations
+            # - Faster than front-based for many small circles
+            self.progress.phase = "Small"
             if self.config.verbose:
-                print(f"\nPhase 3: Micro hex grid fill (gaps >= {min_gap})")
-            
-            gaps = self._find_gaps(min_gap)
-            before = len(all_circles)
-            
-            for gap_center, gap_radius in gaps:
-                micro_radius = max(self.config.min_radius, gap_radius * 0.4)
-                min_pt = gap_center - gap_radius
-                max_pt = gap_center + gap_radius
-                circles = self._pack_hex_grid(micro_radius, min_pt, max_pt)
-                all_circles.extend(circles)
-            
-            if self.config.verbose:
-                print(f"  Filled {len(gaps)} gaps, added {len(all_circles) - before} circles")
-            
-            # Phase 4: Random cleanup
-            self.progress.phase = "Cleanup"
-            if self.config.verbose:
-                print(f"\nPhase 4: Random sampling cleanup")
+                print(f"\nPhase 3: Small circles (random sampling)")
             
             before = len(all_circles)
             circles = self._pack_random(
                 min_radius=self.config.min_radius,
-                max_attempts=self.config.max_failed_attempts // 2
+                max_attempts=self.config.max_failed_attempts
             )
             all_circles.extend(circles)
             
             if self.config.verbose:
-                print(f"  Added {len(all_circles) - before} cleanup circles")
+                print(f"  Added {len(all_circles) - before} small circles")
         
         if self.config.verbose:
+            # Calculate final density
+            total_area = sum(np.pi * r**2 for _, _, r in all_circles)
+            poly_area = self._estimate_polygon_area()
+            density = (total_area / poly_area * 100) if poly_area > 0 else 0
+            
             print(f"\n{'=' * 60}")
-            print(f"TOTAL: {len(all_circles)} circles")
+            print(f"TOTAL: {len(all_circles)} circles, {density:.1f}% density")
             print("=" * 60)
         
         return all_circles
+
+    def _estimate_polygon_area(self) -> float:
+        """Estimate polygon area using shoelace formula."""
+        total_area = 0
+        for poly in self.geometry.polygons:
+            n = len(poly)
+            area = 0
+            for i in range(n):
+                j = (i + 1) % n
+                area += poly[i][0] * poly[j][1]
+                area -= poly[j][0] * poly[i][1]
+            total_area += abs(area) / 2
+        return total_area
 
     # =========================================================================
     # Main Entry Points
