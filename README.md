@@ -2,6 +2,11 @@
 
 State-of-the-art circle packing for arbitrary polygons.
 
+![packed star](star\_packed.png) 
+
+
+
+
 ```bash
 pip install diskpack
 ```
