@@ -2,7 +2,7 @@
 
 State-of-the-art circle packing for arbitrary polygons.
 
-![packed star](star\_packed.png) 
+![packed star](https://raw.githubusercontent.com/semajyllek/diskpack/main/star_packed.png) 
 
 
 
@@ -180,7 +180,7 @@ Fixed radius (r=3.0) on Star shape:
 
 diskpack achieves higher density and faster packing compared to the Python Shapely library. Where Shapely creates Python objects for each point-in-polygon and distance check, diskpack uses vectorized NumPy operations with precomputed edge geometry and batched candidate evaluation — sampling many points per iteration and greedily placing the largest valid circle. A grid-based spatial index keeps collision detection O(1) as circle count grows. The batched Shapely method can approach similar density by also picking the best of many candidates, but at ~30x the runtime due to per-point object overhead.
 
-![diskpack vs shapely comparison](diskpack_shapely_comp.png)
+![diskpack vs shapely comparison](https://raw.githubusercontent.com/semajyllek/diskpack/main/diskpack_shapely_comp.png)
 
 | Method | Circles | Density | Time |
 |--------|---------|---------|------|
